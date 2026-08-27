@@ -23,10 +23,12 @@ import (
 )
 
 var (
-	client    *whatsmeow.Client
-	qrMutex   sync.Mutex
-	currentQR string
-	connected bool
+	client       *whatsmeow.Client
+	qrMutex      sync.Mutex
+	currentQR    string
+	connected    bool
+	reconnectMu  sync.Mutex
+	isReconnecting bool
 )
 
 type SendRequest struct {
@@ -83,8 +85,8 @@ func main() {
 	client = whatsmeow.NewClient(deviceStore, clientLog)
 	client.AddEventHandler(eventHandler)
 
-	// Connect in background — will print QR if not paired
-	go connectWhatsApp()
+	// Connect in background — will loop with auto-reconnect
+	go connectLoop()
 
 	// HTTP server
 	mux := http.NewServeMux()
@@ -127,41 +129,88 @@ func main() {
 	}
 }
 
-func connectWhatsApp() {
-	if client.Store.ID != nil {
-		// Already paired — just connect
-		log.Println("Session found, connecting to WhatsApp...")
-		if err := client.Connect(); err != nil {
-			log.Printf("Failed to connect: %v", err)
-		}
-		return
-	}
-
-	// Not paired — generate QR codes.
-	// GetQRChannel must be called BEFORE Connect.
-	log.Println("No session found. Generating QR code for pairing...")
-	qrChan, err := client.GetQRChannel(context.Background())
-	if err != nil {
-		log.Printf("Failed to get QR channel: %v", err)
-		return
-	}
-
-	go func() {
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				qrMutex.Lock()
-				currentQR = evt.Code
-				qrMutex.Unlock()
-				log.Printf("QR CODE: %s", evt.Code)
-			} else {
-				log.Printf("QR channel event: %s", evt.Event)
+// connectLoop keeps trying to connect — generates fresh QR codes after
+// timeouts, and auto-reconnects when already paired.
+func connectLoop() {
+	for {
+		if client.Store.ID != nil {
+			// Already paired — just connect
+			if !client.IsConnected() {
+				log.Println("Session found, connecting to WhatsApp...")
+				err := client.Connect()
+				if err != nil {
+					log.Printf("Failed to connect: %v — retrying in 5s", err)
+					time.Sleep(5 * time.Second)
+					continue
+				}
 			}
+			// If already connected, wait for disconnect events
+			time.Sleep(5 * time.Second)
+			continue
 		}
-	}()
 
-	if err := client.Connect(); err != nil {
-		log.Printf("Failed to connect for QR: %v", err)
-		return
+		// Not paired — generate QR codes.
+		// GetQRChannel must be called BEFORE Connect.
+		// We need to disconnect first if stale, then reconnect fresh.
+		if client.IsConnected() {
+			client.Disconnect()
+		}
+
+		log.Println("No session found. Generating QR code for pairing...")
+		qrChan, err := client.GetQRChannel(context.Background())
+		if err != nil {
+			// If GetQRChannel fails, it usually means we need to disconnect first
+			log.Printf("Failed to get QR channel: %v — retrying in 3s", err)
+			client.Disconnect()
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		// Consume QR events in a goroutine
+		qrDone := make(chan bool, 1)
+		go func() {
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					qrMutex.Lock()
+					currentQR = evt.Code
+					qrMutex.Unlock()
+					log.Printf("QR CODE: %s", evt.Code)
+				} else {
+					log.Printf("QR channel event: %s", evt.Event)
+					if evt.Event == "timeout" || evt.Event == "error" {
+						qrDone <- true
+						return
+					}
+				}
+			}
+			qrDone <- true
+		}()
+
+		if err := client.Connect(); err != nil {
+			log.Printf("Failed to connect for QR: %v — retrying in 5s", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		// Wait for either QR timeout or successful pairing
+		<-qrDone
+
+		// Check if we got paired during that session
+		if client.Store.ID != nil {
+			log.Println("Paired! Switching to connected mode.")
+			qrMutex.Lock()
+			currentQR = ""
+			qrMutex.Unlock()
+			continue // Will enter the paired branch above
+		}
+
+		// QR timed out — disconnect, wait, and try again with fresh codes
+		log.Println("QR timed out. Reconnecting to generate fresh codes...")
+		client.Disconnect()
+		qrMutex.Lock()
+		currentQR = ""
+		qrMutex.Unlock()
+		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -182,7 +231,7 @@ func eventHandler(evt any) {
 		qrMutex.Lock()
 		connected = false
 		qrMutex.Unlock()
-		log.Println("Disconnected from WhatsApp")
+		log.Println("Disconnected from WhatsApp — will auto-reconnect")
 	case *events.Message:
 		sender := ""
 		if !v.Info.Sender.IsEmpty() {
