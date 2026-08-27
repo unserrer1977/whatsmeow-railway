@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	_ "github.com/mattn/go-sqlite3" // register sqlite3 driver
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"

@@ -2,7 +2,10 @@ module whatsmeow-app
 
 go 1.27.0
 
-require go.mau.fi/whatsmeow v0.0.0-20260821141805-33cfac511629
+require (
+	github.com/mattn/go-sqlite3 v1.14.49
+	go.mau.fi/whatsmeow v0.0.0-20260821141805-33cfac511629
+)
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
