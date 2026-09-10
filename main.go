@@ -22,6 +22,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
 )
 
 // ─── State ──────────────────────────────────────────────────────────────────
@@ -40,6 +41,7 @@ type SendRequest struct {
 	Phone   string `json:"phone"`   // E.164 format (for private chats)
 	GroupID string `json:"groupId"` // WhatsApp group JID (for group messages)
 	Message string `json:"message"` // Text body
+	Mentions []string `json:"mentions"` // digits-only phone numbers to @tag (groups)
 }
 
 type SendResponse struct {
@@ -478,9 +480,37 @@ func sendGroupHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := client.SendMessage(r.Context(), jid, &waE2E.Message{
-		Conversation: &req.Message,
-	})
+	msg := &waE2E.Message{
+		Conversation: proto.String(req.Message),
+	}
+
+	// If mentions were supplied, send as an ExtendedTextMessage carrying
+	// ContextInfo.MentionedJID so WhatsApp renders real @mentions.
+	if len(req.Mentions) > 0 {
+		jids := make([]string, 0, len(req.Mentions))
+		for _, m := range req.Mentions {
+			digits := strings.Map(func(r rune) rune {
+				if r >= '0' && r <= '9' {
+					return r
+				}
+				return -1
+			}, m)
+			if digits == "" {
+				continue
+			}
+			jids = append(jids, types.NewJID(digits, types.DefaultUserServer).String())
+		}
+		if len(jids) > 0 {
+			msg = &waE2E.Message{
+				ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+					Text:        proto.String(req.Message),
+					ContextInfo: &waE2E.ContextInfo{MentionedJID: jids},
+				},
+			}
+		}
+	}
+
+	resp, err := client.SendMessage(r.Context(), jid, msg)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(SendResponse{Error: "Send failed: " + err.Error()})
